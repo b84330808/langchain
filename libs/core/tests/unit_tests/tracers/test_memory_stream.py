@@ -6,6 +6,7 @@ import time
 import weakref
 from collections.abc import AsyncIterator, Callable
 from typing import Any, TypeVar
+from unittest.mock import patch
 
 from langchain_core.tracers.event_stream import _AstreamEventsCallbackHandler
 from langchain_core.tracers.log_stream import LogStreamCallbackHandler
@@ -146,6 +147,62 @@ async def test_closed_stream() -> None:
     await writer.aclose()
 
     assert [chunk async for chunk in reader] == []
+
+
+async def test_send_on_reader_loop_skips_threadsafe_wakeup() -> None:
+    """Sends made on the reader's own loop must not go through the self-pipe.
+
+    `call_soon_threadsafe` writes to the loop's self-pipe on every call, which
+    is only needed to wake the loop from another thread.
+    """
+    reader_loop = asyncio.get_running_loop()
+    channel = _MemoryStream[int](reader_loop)
+    writer = channel.get_send_stream()
+    reader = channel.get_receive_stream()
+
+    with patch.object(
+        reader_loop,
+        "call_soon_threadsafe",
+        wraps=reader_loop.call_soon_threadsafe,
+    ) as threadsafe:
+        for i in range(3):
+            writer.send_nowait(i)
+        await writer.send(3)
+        await writer.aclose()
+        items = [item async for item in reader]
+
+    assert items == [0, 1, 2, 3]
+    threadsafe.assert_not_called()
+
+
+async def test_send_from_other_thread_uses_threadsafe_wakeup() -> None:
+    """Sends from another thread must still wake the reader's loop."""
+    reader_loop = asyncio.get_running_loop()
+    channel = _MemoryStream[int](reader_loop)
+    writer = channel.get_send_stream()
+    reader = channel.get_receive_stream()
+
+    def produce() -> None:
+        for i in range(3):
+            writer.send_nowait(i)
+        writer.close()
+
+    with patch.object(
+        reader_loop,
+        "call_soon_threadsafe",
+        wraps=reader_loop.call_soon_threadsafe,
+    ) as threadsafe:
+        producer = asyncio.create_task(asyncio.to_thread(produce))
+        items = [item async for item in reader]
+        await producer
+
+    assert items == [0, 1, 2]
+    queued = [
+        call.args[1]
+        for call in threadsafe.call_args_list
+        if call.args and call.args[0] == channel._queue.put_nowait
+    ]
+    assert queued == [0, 1, 2, channel._done]
 
 
 def _run_in_thread(fn: Callable[[], T]) -> T:

@@ -87,6 +87,27 @@ class _SendStream(Generic[T]):
         self._queue = queue
         self._done = done
 
+    def _schedule_put(self, item: Any) -> None:
+        """Schedule `item` to be put on the queue by the reader's loop.
+
+        `call_soon_threadsafe` also wakes the loop up by writing to its self-pipe,
+        which is a socket send on every call. That wake-up is only needed when the
+        writer runs on another thread. When the writer is already running on the
+        reader's loop, `call_soon` schedules the same callback in the same order
+        without the extra system call.
+
+        Args:
+            item: The item to put on the queue.
+        """
+        try:
+            running_loop: AbstractEventLoop | None = asyncio.get_running_loop()
+        except RuntimeError:
+            running_loop = None
+        if running_loop is self._reader_loop:
+            self._reader_loop.call_soon(self._queue.put_nowait, item)
+        else:
+            self._reader_loop.call_soon_threadsafe(self._queue.put_nowait, item)
+
     async def send(self, item: T) -> None:
         """Schedule the item to be written to the queue using the original loop.
 
@@ -110,7 +131,7 @@ class _SendStream(Generic[T]):
                 the queue.
         """
         try:
-            self._reader_loop.call_soon_threadsafe(self._queue.put_nowait, item)
+            self._schedule_put(item)
         except RuntimeError:
             if not self._reader_loop.is_closed():
                 raise  # Raise the exception if the loop is not closed
@@ -129,7 +150,7 @@ class _SendStream(Generic[T]):
                 the queue.
         """
         try:
-            self._reader_loop.call_soon_threadsafe(self._queue.put_nowait, self._done)
+            self._schedule_put(self._done)
         except RuntimeError:
             if not self._reader_loop.is_closed():
                 raise  # Raise the exception if the loop is not closed
